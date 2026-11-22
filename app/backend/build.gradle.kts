@@ -28,6 +28,9 @@ dependencyLocking {
 }
 
 dependencies {
+    // vuln-samples:begin (intentionally vulnerable, added by app/vuln-samples/apply.sh)
+    implementation("org.apache.logging.log4j:log4j-core:2.14.1")
+    // vuln-samples:end
     implementation("org.springframework.boot:spring-boot-starter-webmvc")
     implementation("org.springframework.boot:spring-boot-starter-validation")
     implementation("org.springframework.boot:spring-boot-starter-data-jpa")
