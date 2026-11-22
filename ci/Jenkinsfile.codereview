@@ -1,0 +1,289 @@
+// =====================================================================================
+// cicd-ai-flow - AI Code Review pipeline (Jenkins multibranch job "cicd-ai-flow-codereview",
+// pull requests only, script path ci/Jenkinsfile.codereview). See docs/PIPELINE.md.
+//
+//   Checkout PR -> Build & Test (backend | frontend) -> Static Scan (Trivy fs [+ Sonar PR])
+//   -> AI Code Review (Gemini, hunk 별 인라인 코멘트 + 총평 -> GitHub PR Review) -> Report
+//
+// Only runs for pull requests (env.CHANGE_ID). PR discovery strategy 1 (merge with target)
+// means HEAD is a merge commit: PR head = HEAD^2, base = merge-base(origin/<target>, head).
+// Credentials: github-token (usernamePassword), gemini-api-key (secret text; empty -> UNSTABLE).
+// =====================================================================================
+pipeline {
+    agent { label 'cicd-agent' }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 40, unit: 'MINUTES')
+        skipDefaultCheckout()
+    }
+
+    parameters {
+        booleanParam(name: 'SONAR_PR_SCAN', defaultValue: false,
+            description: 'true 면 SonarQube 에 PR 전용 프로젝트(cicd-ai-flow-pr)로 분석을 올리고 결과를 리뷰 총평에 포함 (Community Edition 은 PR 분석 미지원이라 별도 projectKey 사용)')
+        string(name: 'GEMINI_MODEL', defaultValue: 'gemini-2.5-pro',
+            description: 'Gemini 모델 (예: gemini-2.5-pro, gemini-2.5-flash)')
+        string(name: 'REVIEW_LANGUAGE', defaultValue: 'ko', description: '리뷰 코멘트 언어 (ko | en)')
+        string(name: 'REVIEW_MAX_FILES', defaultValue: '50', description: '리뷰할 최대 파일 수 (초과분은 총평에 미검토로 표기)')
+        choice(name: 'REVIEW_GRANULARITY', choices: ['file', 'hunk'],
+            description: 'Gemini 호출 단위. file = 파일당 1회(hunk 별 코멘트 요구, 기본), hunk = hunk 마다 1회(정확하지만 호출 수 증가)')
+        booleanParam(name: 'REVIEW_DRY_RUN', defaultValue: false,
+            description: 'true 면 GitHub 에 게시하지 않고 review-dryrun.md 만 생성 (검증용)')
+        string(name: 'GEMINI_FAKE', defaultValue: '',
+            description: '1 이면 Gemini API 를 호출하지 않고 gemini_review.py 의 결정적 가짜 백엔드 사용 (GEMINI_API_KEY 불필요, 검증/시뮬레이션용)')
+    }
+
+    environment {
+        GRADLE_OPTS     = '-Dorg.gradle.daemon=false'
+        CI              = 'true'
+        TRIVY_SEVERITY  = 'HIGH,CRITICAL'
+        TRIVY_SKIP_DIRS = '**/node_modules,**/.git,app/vuln-samples,app/backend/.gradle,app/backend/build,app/frontend/dist,app/frontend/coverage,infra'
+        GEMINI_MODEL    = "${params.GEMINI_MODEL ?: 'gemini-2.5-pro'}"
+        REVIEW_LANGUAGE = "${params.REVIEW_LANGUAGE ?: 'ko'}"
+        SONAR_PR_KEY    = 'cicd-ai-flow-pr'
+    }
+
+    stages {
+        // ---------------------------------------------------------------------------
+        stage('Not a PR') {
+            when { expression { return (env.CHANGE_ID ?: '').trim() == '' } }
+            steps {
+                echo "CHANGE_ID 가 없습니다 (브랜치 빌드). 이 파이프라인은 Pull Request 에서만 동작하므로 모든 스테이지를 건너뜁니다."
+                script { currentBuild.description = 'skipped (not a pull request)' }
+            }
+        }
+
+        // ---------------------------------------------------------------------------
+        stage('Checkout PR') {
+            when { expression { return (env.CHANGE_ID ?: '').trim() != '' } }
+            steps {
+                checkout scm
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    chmod +x app/backend/gradlew ci/scripts/*.sh
+                    chmod +x app/vuln-samples/*.sh 2>/dev/null || true
+                    sed -i 's/\\r$//' app/backend/gradlew ci/scripts/*.sh 2>/dev/null || true
+                '''
+                // 멀티브랜치 PR 체크아웃은 PR ref 만 가져오므로 base 브랜치를 명시적으로 fetch (private repo 대비 credential helper 사용)
+                withCredentials([usernamePassword(credentialsId: 'github-token', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_PASS')]) {
+                    sh '''#!/usr/bin/env bash
+                        set -uo pipefail
+                        git -c credential.helper='!f() { echo "username=${GIT_USER}"; echo "password=${GIT_PASS}"; }; f' \
+                            fetch --no-tags origin "+refs/heads/${CHANGE_TARGET}:refs/remotes/origin/${CHANGE_TARGET}" \
+                          || echo "WARN: origin/${CHANGE_TARGET} fetch 실패 - merge 커밋의 첫 번째 부모를 base 로 사용합니다"
+                    '''
+                }
+                script {
+                    // PR head: merge 커밋이면 두 번째 부모, 아니면 HEAD 자체
+                    env.PR_HEAD_SHA = sh(returnStdout: true, script: 'git rev-parse -q --verify HEAD^2 2>/dev/null || git rev-parse HEAD').trim()
+                    env.BASE_SHA = sh(returnStdout: true, script: '''#!/usr/bin/env bash
+                        set -euo pipefail
+                        if git rev-parse -q --verify "origin/${CHANGE_TARGET}" >/dev/null 2>&1; then
+                          git merge-base "origin/${CHANGE_TARGET}" "${PR_HEAD_SHA}"
+                        elif git rev-parse -q --verify HEAD^2 >/dev/null 2>&1; then
+                          git merge-base HEAD^1 HEAD^2
+                        else
+                          echo "WARN: base 브랜치를 알 수 없어 HEAD^1 을 base 로 사용" >&2
+                          git rev-parse HEAD^1
+                        fi
+                    ''').trim()
+                    // https://github.com/<owner>/<repo>/pull/<n>  ->  owner/repo
+                    def parts = (env.CHANGE_URL ?: '').tokenize('/')
+                    env.GH_REPO = parts.size() >= 4 ? "${parts[2]}/${parts[3]}" : ''
+                    String checkoutSha = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
+                    currentBuild.displayName = "#${env.BUILD_NUMBER} PR-${env.CHANGE_ID} ${env.PR_HEAD_SHA.take(8)}"
+                    echo "PR #${env.CHANGE_ID} '${env.CHANGE_TITLE}' by ${env.CHANGE_AUTHOR}: ${env.CHANGE_BRANCH} -> ${env.CHANGE_TARGET} (${env.CHANGE_URL})"
+                    echo "repo=${env.GH_REPO} base=${env.BASE_SHA} head=${env.PR_HEAD_SHA} checkout=${checkoutSha}"
+                }
+                sh 'git --no-pager diff --stat "${BASE_SHA}...${PR_HEAD_SHA}" | tail -n 30'
+            }
+        }
+
+        // ---------------------------------------------------------------------------
+        stage('Build & Test') {
+            when { expression { return (env.CHANGE_ID ?: '').trim() != '' } }
+            parallel {
+                stage('Backend') {
+                    steps {
+                        script {
+                            int rc = sh(returnStatus: true, script: 'cd app/backend && ./gradlew build jacocoTestReport --no-daemon')
+                            env.BACKEND_BUILD_RC = "${rc}"
+                            if (rc != 0) {
+                                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                                    error("backend build/test 실패 (exit ${rc}) - 리뷰는 계속 진행")
+                                }
+                            }
+                        }
+                    }
+                    post {
+                        always {
+                            script {
+                                def r = junit(testResults: 'app/backend/build/test-results/test/*.xml', allowEmptyResults: true)
+                                env.BACKEND_TESTS = r ? "total=${r.totalCount} failed=${r.failCount} skipped=${r.skipCount}" : 'no results'
+                            }
+                        }
+                    }
+                }
+                stage('Frontend') {
+                    steps {
+                        script {
+                            int rc = sh(returnStatus: true, script: 'cd app/frontend && npm ci --no-audit --no-fund && npm run lint && npm run test -- --run --coverage')
+                            env.FRONTEND_BUILD_RC = "${rc}"
+                            if (rc != 0) {
+                                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                                    error("frontend lint/test 실패 (exit ${rc}) - 리뷰는 계속 진행")
+                                }
+                            }
+                        }
+                    }
+                    post {
+                        always {
+                            script {
+                                def r = junit(testResults: 'app/frontend/coverage/junit.xml', allowEmptyResults: true)
+                                env.FRONTEND_TESTS = r ? "total=${r.totalCount} failed=${r.failCount} skipped=${r.skipCount}" : 'no results'
+                            }
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    script {
+                        // 리뷰 총평 입력 (gemini_review.py --summary-file)
+                        writeFile file: 'ci-summary.txt', text: """PR #${env.CHANGE_ID}: ${env.CHANGE_TITLE} (${env.CHANGE_BRANCH} -> ${env.CHANGE_TARGET}) by ${env.CHANGE_AUTHOR}
+head=${env.PR_HEAD_SHA} base=${env.BASE_SHA} build=${env.BUILD_URL}
+Backend : gradle build+jacoco exit=${env.BACKEND_BUILD_RC ?: 'n/a'} (0=OK; check 는 JaCoCo line coverage 80% 검증 포함), tests ${env.BACKEND_TESTS ?: 'n/a'}
+Frontend: npm ci + lint + vitest exit=${env.FRONTEND_BUILD_RC ?: 'n/a'} (0=OK), tests ${env.FRONTEND_TESTS ?: 'n/a'}
+"""
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------------------
+        stage('Static Scan') {
+            when { expression { return (env.CHANGE_ID ?: '').trim() != '' } }
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    trivy fs --scanners vuln,secret,misconfig --severity "${TRIVY_SEVERITY}" --ignore-unfixed \
+                             --skip-dirs "${TRIVY_SKIP_DIRS}" --format json -o trivy-fs.json .
+                    echo "== Trivy fs (${TRIVY_SEVERITY}) =="
+                    trivy convert --format table trivy-fs.json || true
+                    {
+                      echo ""
+                      echo "== Trivy fs (${TRIVY_SEVERITY}; vuln,secret,misconfig; report-only) =="
+                      GATE_MAX_LIST=20 ci/scripts/trivy_gate.sh trivy-fs.json "${TRIVY_SEVERITY}" --report-only 2>&1 || true
+                    } >> ci-summary.txt
+                '''
+                script {
+                    if (params.SONAR_PR_SCAN) {
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE', message: 'SonarQube PR 분석 실패 (리뷰는 계속)') {
+                            withSonarQubeEnv('SonarQube') {
+                                sh '''#!/usr/bin/env bash
+                                    set -euo pipefail
+                                    export SONAR_TOKEN="${SONAR_AUTH_TOKEN:-${SONAR_TOKEN:-}}"
+                                    sonar-scanner \
+                                      -Dsonar.projectKey="${SONAR_PR_KEY}" \
+                                      -Dsonar.projectName="cicd-ai-flow (PR)" \
+                                      -Dsonar.projectVersion="PR-${CHANGE_ID}" \
+                                      -Dsonar.links.ci="${BUILD_URL}"
+                                '''
+                            }
+                            timeout(time: 5, unit: 'MINUTES') {
+                                def qg = waitForQualityGate(abortPipeline: false)
+                                sh "echo '' >> ci-summary.txt; echo 'SonarQube (${env.SONAR_PR_KEY}): quality gate ${qg.status} - http://localhost:9000/dashboard?id=${env.SONAR_PR_KEY}' >> ci-summary.txt"
+                            }
+                        }
+                    } else {
+                        echo 'SONAR_PR_SCAN=false: SonarQube PR 분석 생략'
+                    }
+                }
+                sh 'echo "== ci-summary.txt =="; cat ci-summary.txt'
+            }
+        }
+
+        // ---------------------------------------------------------------------------
+        stage('AI Code Review') {
+            when { expression { return (env.CHANGE_ID ?: '').trim() != '' } }
+            steps {
+                script {
+                    int rc = -1
+                    catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE', message: 'credential 바인딩 실패 (gemini-api-key / github-token 확인)') {
+                        withCredentials([string(credentialsId: 'gemini-api-key', variable: 'GEMINI_API_KEY'),
+                                         usernamePassword(credentialsId: 'github-token', usernameVariable: 'GITHUB_USERNAME', passwordVariable: 'GITHUB_TOKEN')]) {
+                            rc = sh(returnStatus: true, script: '''#!/usr/bin/env bash
+                                set -uo pipefail
+                                # GEMINI_FAKE=1 이면 키 없이도 가짜 백엔드로 실행(시뮬레이션/검증용). 키도 없고 fake 도 아니면 exit 3 -> UNSTABLE
+                                if [ "${GEMINI_FAKE:-}" = "1" ]; then
+                                  echo "GEMINI_FAKE=1: Gemini API 를 호출하지 않고 결정적 가짜 백엔드로 리뷰를 생성합니다 (GEMINI_API_KEY 불필요)."
+                                elif [ -z "${GEMINI_API_KEY:-}" ]; then
+                                  echo "WARNING: GEMINI_API_KEY 가 비어 있습니다. Jenkins credential 'gemini-api-key' 를 수정하거나 infra/.env 의 GEMINI_API_KEY 를 채우고 up.sh 를 다시 실행하세요. AI 리뷰를 건너뜁니다."
+                                  exit 3
+                                fi
+                                EXTRA=""
+                                if [ "${REVIEW_DRY_RUN:-false}" = "true" ]; then EXTRA="--dry-run"; fi
+                                python3 ci/scripts/gemini_review.py \
+                                  --base "${BASE_SHA}" --head "${PR_HEAD_SHA}" \
+                                  --pr "${CHANGE_ID}" --repo "${GH_REPO}" --pr-title "${CHANGE_TITLE:-}" \
+                                  --summary-file ci-summary.txt \
+                                  --max-files "${REVIEW_MAX_FILES:-50}" --granularity "${REVIEW_GRANULARITY:-file}" \
+                                  --language "${REVIEW_LANGUAGE}" --model "${GEMINI_MODEL}" ${EXTRA}
+                            ''')
+                        }
+                    }
+                    env.REVIEW_RC = "${rc}"
+                    if (rc == 3) {
+                        unstable('GEMINI_API_KEY 미설정 - AI 리뷰 스테이지를 건너뜀 (UNSTABLE)')
+                    } else if (rc == -1) {
+                        unstable('credential 바인딩 실패로 AI 리뷰를 실행하지 못함 (UNSTABLE)')
+                    } else if (rc != 0) {
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            error("AI 리뷰 실패 (exit ${rc}; 2=인자/git, 4=GitHub 게시 실패) - 로그와 review-result.json 확인")
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------------------
+        stage('Report') {
+            when { expression { return (env.CHANGE_ID ?: '').trim() != '' } }
+            steps {
+                script {
+                    String desc = "PR #${env.CHANGE_ID} ${env.CHANGE_BRANCH} -> ${env.CHANGE_TARGET}"
+                    if (fileExists('review-result.json')) {
+                        def r = readJSON(file: 'review-result.json')
+                        int total   = (r.stats?.comments_total ?: 0) as int
+                        int inline  = (r.stats?.comments_inline ?: 0) as int
+                        String rec  = r.summary?.recommendation ?: 'n/a'
+                        String risk = r.summary?.risk ?: 'n/a'
+                        String mode = r.posted?.mode ?: 'n/a'
+                        String url  = r.posted?.url ?: ''
+                        r = null
+                        desc += " | AI 코멘트 ${total}건 (inline ${inline}) | 권고 ${rec} / 위험도 ${risk} | ${mode}" + (url ? " ${url}" : '')
+                    } else {
+                        desc += " | AI 리뷰 없음 (rc=${env.REVIEW_RC ?: 'n/a'})"
+                    }
+                    desc += " | backend ${env.BACKEND_TESTS ?: 'n/a'} | frontend ${env.FRONTEND_TESTS ?: 'n/a'}"
+                    currentBuild.description = desc
+                    echo "REPORT: ${desc}"
+                    echo "GitHub commit status 는 github-branch-source 플러그인이 빌드 결과(SUCCESS/UNSTABLE/FAILURE)로 자동 갱신합니다."
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------------
+    post {
+        always {
+            archiveArtifacts artifacts: 'review-*.json, review-dryrun.md, ci-summary.txt, trivy-*.json, app/backend/build/reports/**, app/frontend/coverage/**',
+                             allowEmptyArchive: true, fingerprint: false
+        }
+        cleanup {
+            cleanWs(deleteDirs: true, notFailBuild: true)
+        }
+    }
+}

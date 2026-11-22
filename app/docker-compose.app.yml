@@ -1,0 +1,64 @@
+# Deploy target for the cicd-ai-flow pipeline (Deploy stage).
+#
+#   IMAGE_TAG=<git-sha> docker compose -f app/docker-compose.app.yml up -d --build
+#   docker compose -f app/docker-compose.app.yml down
+#
+# IMAGE_TAG defaults to "latest". Both images are built from the sibling Dockerfiles when
+# --build is given; without --build, compose expects cicd-ai-flow/{backend,frontend}:${IMAGE_TAG}
+# to already exist (e.g. built by the Package stage).
+name: cicd-ai-flow-app
+
+services:
+  backend:
+    image: cicd-ai-flow/backend:${IMAGE_TAG:-latest}
+    build:
+      context: ./backend
+    container_name: cicd-app-backend
+    ports:
+      - "8081:8081"
+    environment:
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-default}
+    # Health check is inherited from the image (bash /dev/tcp probe of /actuator/health);
+    # declared here again so `depends_on: service_healthy` is explicit and tunable.
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -c
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/8081
+          && printf 'GET /actuator/health HTTP/1.0\r\nHost: localhost\r\n\r\n' >&3
+          && grep -q '"status":"UP"' <&3
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - app
+
+  frontend:
+    image: cicd-ai-flow/frontend:${IMAGE_TAG:-latest}
+    build:
+      context: ./frontend
+    container_name: cicd-app-frontend
+    # nginx-unprivileged listens on 8080 inside the container (non-root); host port stays 3000.
+    ports:
+      - "3000:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - app
+
+networks:
+  app:
+    name: cicd-ai-flow-app-net
+    driver: bridge

@@ -1,0 +1,38 @@
+# Jenkins plugins for cicd-ai-flow (DESIGN.md section 2 + agent/SSH support).
+# No versions pinned: jenkins-plugin-cli resolves the latest versions that are
+# compatible with the LTS core of the base image.
+
+# configuration / seeding
+configuration-as-code
+job-dsl
+
+# pipeline
+workflow-aggregator
+pipeline-stage-view
+pipeline-graph-view
+pipeline-utility-steps
+docker-workflow
+
+# SCM / GitHub
+git
+github
+github-branch-source
+
+# quality / reports
+sonar
+junit
+jacoco
+htmlpublisher
+warnings-ng
+
+# credentials
+credentials-binding
+plain-credentials
+ssh-credentials
+
+# static agent over SSH
+ssh-slaves
+
+# misc
+timestamper
+ws-cleanup

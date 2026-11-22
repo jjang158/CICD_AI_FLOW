@@ -1,0 +1,8 @@
+app:
+  sample-data:
+    enabled: false
+
+logging:
+  level:
+    root: WARN
+    com.cicdaiflow: INFO

@@ -1,0 +1,39 @@
+# --- Node / frontend ---
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.vite/
+
+# --- Gradle / backend ---
+build/
+.gradle/
+.kotlin/
+out/
+bin/
+
+# --- Logs & env ---
+*.log
+.env
+.env.*
+!.env.example
+infra/secrets/
+
+# --- Scanner / security tooling output ---
+.scannerwork/
+trivy-*.json
+trivy-*.txt
+trivy-*.sarif
+
+# --- IDE ---
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.DS_Store
+Thumbs.db
+
+# --- Python ---
+__pycache__/
+*.pyc
