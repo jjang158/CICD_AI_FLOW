@@ -46,7 +46,8 @@
 | `cicd-ai-flow-cicd » main` #1 | 검증 중 에이전트 컨테이너를 재시작해 Package 에서 중단(환경 테스트의 부작용) |
 | `cicd-ai-flow-cicd » main` #2 | **SUCCESS** 2분 33초: Sonar QG OK, Trivy 0, 이미지 CRITICAL 0, `cicd-app-*` 배포, 스모크 ALL PASSED |
 | `cicd-ai-flow-codereview » PR-1` #1 | PR 발견 후 1분 내 빌드, **SUCCESS**: Build&Test(26/22 PASS) → Trivy 7건 보고 → GitHub review 게시(inline 6 + 총평) → commit status `continuous-integration/jenkins/pr-merge` success. 단 Gemini 가 전부 404(`gemini-2.5-pro` 는 신규 사용자 사용 불가) → placeholder 코멘트 |
-| 모델 교체 후 재검증 | (아래 3.3) |
+| `cicd-ai-flow-codereview » PR-2` #1 (모델 교체 PR, 클린 변경) | **SUCCESS** 2분 3초: `gemini-3.5-flash` 로 9개 파일·22 hunk 리뷰, inline **22건**(info 21, minor 1) + 총평(위험도 low, **approve**, 테스트/Trivy 결과 포함) GitHub 게시, 모델 전환 없음, JSON 파싱 재요청 1회 |
+| `cicd-ai-flow-codereview » PR-1` #2 (취약 데모, `GEMINI_MODEL=gemini-3.5-flash` 파라미터) | **SUCCESS**: inline 9건 — `InsecureRandomToken.kt`(CRITICAL, `SecureRandom` 권고), `UnsafeHtml.tsx` eval(CRITICAL)·XSS(CRITICAL)·하드코딩 시크릿(MAJOR) 등 실제 코멘트 5건 + 총평 **request-changes / high**. 단 PR-2 직후라 무료 티어 quota(429)로 hunk 4개·총평은 placeholder. 이 빌드는 PR #2 머지 전 스크립트(폴백 없음) 기준 |
 
 ### 3.3 Gemini 모델 (2026-11-23 실측)
 
@@ -56,9 +57,12 @@
 | `gemini-3.1-pro-preview` 등 pro 계열 | 429 quota exceeded (무료 티어) |
 | `gemini-3.5-flash` (GA), `gemini-3.5-flash-lite`, `gemini-3-flash-preview`, `gemini-3.1-flash-lite` | 200 OK |
 
-→ 기본 모델 `gemini-3.5-flash`, fallback `gemini-3-flash-preview,gemini-3.1-flash-lite` 로 변경. 재검증 결과는 아래에 추가.
+→ 기본 모델 `gemini-3.5-flash`, fallback `gemini-3-flash-preview,gemini-3.1-flash-lite` 로 변경(PR #2). 라이브 dry-run(데모 diff): 7회 호출 모두 200, 코멘트 9건(critical 8, major 1), 총평 request-changes/high, 전부 한국어·수정 예시 포함.
+무료 티어는 분당/일일 호출 한도가 작아 PR 두 개를 연달아 리뷰하면 429 가 난다. PR #2 머지 후에는 429 지속 시 폴백 모델로 자동 전환되며, 큰 PR 은 `REVIEW_GRANULARITY=file`(기본) 유지를 권장.
 
 ## 4. 남은 항목 / 권고
+
+- **PR #2 머지는 사용자 작업**: 자동화 권한 정책상 main 머지는 수행하지 않았다. 머지하면 `cicd-ai-flow-cicd » main` 이 1분 내 빌드·배포되고, PR-1 도 target 변경으로 재빌드되어 폴백 체인이 적용된 리뷰가 다시 게시된다.
 
 - 사용자 판단: SonarQube `cicd-ai-flow-pr` 프로젝트에 검증용 취약 분석 이력이 남아 있음(전용 게이트는 전체 코드 기준이라 동작에 영향 없음). 깨끗이 하려면 프로젝트 삭제 후 `bootstrap-sonar.sh` 재실행. 로컬 bare repo 의 `verify/vulnerable-code` 브랜치도 삭제 가능.
 - PR #1 에는 모델 교체 전 placeholder 리뷰 1건이 남아 있다(삭제하지 않음).
