@@ -88,6 +88,8 @@ export default function App() {
           {remaining} of {todos.length} remaining
         </footer>
       )}
+
+      cicd 테스트용 v1
     </main>
   );
 }
