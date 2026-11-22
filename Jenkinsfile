@@ -229,7 +229,11 @@ pipeline {
                                 H="${SONAR_HOST_URL%/}"; T="${SONAR_AUTH_TOKEN:-${SONAR_TOKEN:-}}"
                                 GATE="$(curl -sS -m 15 -u "${T}:" "${H}/api/qualitygates/get_by_project?project=${SONAR_KEY}" \
                                         | (jq -r '.qualityGate.name + (if .qualityGate.default then " (default)" else "" end)' 2>/dev/null || true))"
-                                echo "SonarQube gate used for '${SONAR_KEY}': ${GATE:-unknown (조회 실패)}"
+                                if [ -n "${GATE}" ] && [ "${GATE}" != "null" ]; then
+                                  echo "SonarQube gate used for '${SONAR_KEY}': ${GATE}"
+                                else
+                                  echo "SonarQube gate used for '${SONAR_KEY}': unknown - gate lookup not permitted for analysis token (get_by_project needs Administer Quality Gates); bootstrap assigns 'cicd-ai-flow-gate' to this project (see infra/README.md 6.1). Conditions below come from project_status:"
+                                fi
                                 curl -sS -m 15 -u "${T}:" "${H}/api/qualitygates/project_status?projectKey=${SONAR_KEY}" \
                                   | (jq -r '.projectStatus as $p | "SonarQube project_status: " + $p.status + " (newCodePeriod " + (($p.period.mode // "none") + " " + ($p.period.parameter // "")) + ")", (($p.conditions // [])[] | "  - " + .status + " " + .metricKey + " actual=" + (.actualValue // "-") + " " + .comparator + " " + (.errorThreshold // ""))' 2>/dev/null || echo "SonarQube project_status 조회 실패")
                                 exit 0
