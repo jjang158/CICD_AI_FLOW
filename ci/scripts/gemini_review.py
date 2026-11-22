@@ -44,7 +44,13 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 __version__ = "1.0.0"
 
-DEFAULT_MODEL = "gemini-2.5-pro"
+# 기본 모델: 무료 티어에서 pro 계열은 429(quota), gemini-2.5-* 는 404(신규 사용자 불가) 이므로 GA flash 를 쓴다.
+DEFAULT_MODEL = "gemini-3.5-flash"
+# 404(모델 없음/사용 불가) 또는 429 가 재시도 후에도 지속되면 순서대로 전환한다 (env GEMINI_MODEL_FALLBACKS).
+DEFAULT_MODEL_FALLBACKS = "gemini-3-flash-preview,gemini-3.1-flash-lite"
+# thinking 모델은 출력 토큰에 사고 토큰이 포함되므로 넉넉히 (hunk >= 2048, 총평 >= 4096 보장)
+DEFAULT_MAX_OUTPUT_TOKENS_HUNK = 8192
+DEFAULT_MAX_OUTPUT_TOKENS_SUMMARY = 8192
 DEFAULT_GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_GITHUB_API_URL = "https://api.github.com"
 USER_AGENT = "cicd-ai-flow-gemini-review/" + __version__
@@ -413,14 +419,46 @@ def extract_json(text: str) -> Any:
         raise
 
 
+class GeminiModelUnavailable(GeminiError):
+    """HTTP 404: 모델이 없거나 이 키로는 사용할 수 없음 -> 다음 후보 모델로 전환."""
+
+
+class GeminiQuotaExceeded(GeminiError):
+    """HTTP 429 가 재시도 후에도 지속됨 -> 다음 후보 모델로 전환."""
+
+
+class GeminiEmptyResponse(GeminiError):
+    """candidates[].content.parts 에 text 가 없음(사고 토큰 소진 등) -> 파싱 실패와 같이 1회 재요청."""
+
+
+def parse_model_list(value: Optional[str]) -> List[str]:
+    """쉼표 구분 모델 목록 문자열 -> 공백 제거/중복 제거된 리스트."""
+    out: List[str] = []
+    for m in (value or "").split(","):
+        m = m.strip()
+        if m and m not in out:
+            out.append(m)
+    return out
+
+
 class GeminiClient:
-    """generativelanguage ``generateContent`` REST 호출 (재시도/백오프 포함)."""
+    """generativelanguage ``generateContent`` REST 호출 (재시도/백오프 + 모델 fallback 포함).
+
+    - 429/5xx/네트워크 오류: 지수 백오프로 ``retries`` 회 재시도
+    - 404(모델 없음/사용 불가) 또는 429 가 재시도 후에도 지속: ``fallbacks`` 의 다음 모델로 전환하고
+      이후 모든 호출에 그 모델을 사용 (``model_switches`` 에 기록, ``model`` 이 실제 사용 모델)
+    - 빈 텍스트 응답은 ``GeminiEmptyResponse`` -> ``generate_json`` 이 파싱 실패와 같이 1회 재요청
+    """
 
     def __init__(self, api_key: str, model: str = DEFAULT_MODEL, api_url: str = DEFAULT_GEMINI_API_URL,
                  timeout: float = 180.0, retries: int = 3, backoff: float = 2.0,
-                 sleep: Callable[[float], None] = time.sleep, temperature: float = 0.2) -> None:
+                 sleep: Callable[[float], None] = time.sleep, temperature: float = 0.2,
+                 fallbacks: Optional[Sequence[str]] = None) -> None:
         self.api_key = api_key
         self.model = model
+        self.requested_model = model
+        self.fallbacks: List[str] = [m for m in (fallbacks or []) if m and m != model]
+        self.model_switches: List[Dict[str, str]] = []
         self.api_url = api_url.rstrip("/")
         self.timeout = timeout
         self.retries = retries
@@ -429,17 +467,23 @@ class GeminiClient:
         self.temperature = temperature
         self.calls = 0
 
-    def _request(self, prompt: str, system: Optional[str]) -> str:
+    # ---- 단일 모델 호출 (재시도 포함) -------------------------------------------------
+    def _request_with_model(self, prompt: str, system: Optional[str], max_output_tokens: int) -> str:
         url = f"{self.api_url}/models/{self.model}:generateContent"
         body: Dict[str, Any] = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": self.temperature, "responseMimeType": "application/json"},
+            "generationConfig": {
+                "temperature": self.temperature,
+                "responseMimeType": "application/json",
+                "maxOutputTokens": int(max_output_tokens),
+            },
         }
         if system:
             body["systemInstruction"] = {"parts": [{"text": system}]}
         data = json.dumps(body).encode("utf-8")
         headers = {"Content-Type": "application/json", "x-goog-api-key": self.api_key, "User-Agent": USER_AGENT}
-        last_err: Optional[Exception] = None
+        last_err: Optional[GeminiError] = None
+        last_code = 0
         for attempt in range(self.retries):
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
             try:
@@ -450,15 +494,35 @@ class GeminiClient:
             except urllib.error.HTTPError as e:
                 detail = e.read().decode("utf-8", "replace")[:500]
                 e.close()
-                last_err = GeminiError(f"HTTP {e.code} from Gemini: {detail}")
+                last_code = e.code
+                if e.code == 404:
+                    raise GeminiModelUnavailable(f"HTTP 404 from Gemini (model {self.model}): {detail}")
+                last_err = GeminiError(f"HTTP {e.code} from Gemini (model {self.model}): {detail}")
                 if e.code not in RETRY_STATUSES:
                     raise last_err
             except (urllib.error.URLError, TimeoutError, OSError) as e:
-                last_err = GeminiError(f"Gemini 네트워크 오류: {e}")
+                last_code = 0
+                last_err = GeminiError(f"Gemini 네트워크 오류 (model {self.model}): {e}")
             wait = self.backoff * (2 ** attempt)
             log(f"Gemini 호출 실패 (시도 {attempt + 1}/{self.retries}): {last_err}; {wait:.0f}s 후 재시도")
             self.sleep(wait)
+        if last_code == 429:
+            raise GeminiQuotaExceeded(f"HTTP 429 가 {self.retries}회 재시도 후에도 지속 (model {self.model}): {last_err}")
         raise last_err if last_err else GeminiError("Gemini 호출 실패")
+
+    # ---- 모델 fallback -----------------------------------------------------------------
+    def _request(self, prompt: str, system: Optional[str], max_output_tokens: int) -> str:
+        while True:
+            try:
+                return self._request_with_model(prompt, system, max_output_tokens)
+            except (GeminiModelUnavailable, GeminiQuotaExceeded) as e:
+                if not self.fallbacks:
+                    raise
+                nxt = self.fallbacks.pop(0)
+                reason = "404 model unavailable" if isinstance(e, GeminiModelUnavailable) else "429 quota exceeded (after retries)"
+                log(f"모델 전환: {self.model} -> {nxt} ({reason})")
+                self.model_switches.append({"from": self.model, "to": nxt, "reason": reason, "detail": str(e)[:200]})
+                self.model = nxt
 
     @staticmethod
     def _extract_text(payload: Dict[str, Any]) -> str:
@@ -468,24 +532,32 @@ class GeminiClient:
         if not candidates:
             raise GeminiError(f"응답에 candidates 없음: {json.dumps(payload)[:300]}")
         parts = (candidates[0].get("content") or {}).get("parts") or []
-        text = "".join(p.get("text", "") for p in parts)
+        text = "".join(str(p.get("text", "")) for p in parts if isinstance(p, dict) and not p.get("thought"))
         if not text.strip():
-            raise GeminiError(f"빈 응답 (finishReason={candidates[0].get('finishReason')})")
+            raise GeminiEmptyResponse(f"빈 텍스트 응답 (finishReason={candidates[0].get('finishReason')}, parts={len(parts)})")
         return text
 
-    def generate_json(self, prompt: str, system: Optional[str] = None) -> Any:
-        """JSON 응답을 요청하고 파싱한다. 파싱 실패 시 1회 재요청 후 포기."""
-        text = self._request(prompt, system)
+    def generate_json(self, prompt: str, system: Optional[str] = None,
+                      max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS_HUNK) -> Any:
+        """JSON 응답을 요청하고 파싱한다. 파싱 실패/빈 텍스트면 1회 재요청 후 포기."""
+        retry_prompt = prompt + "\n\n직전 응답이 유효한 JSON 이 아니었습니다. 설명이나 코드펜스 없이 JSON 객체 하나만 출력하세요."
         try:
-            return extract_json(text)
-        except (json.JSONDecodeError, ValueError):
-            log("응답 JSON 파싱 실패 - JSON 만 출력하도록 1회 재요청")
-            retry_prompt = prompt + "\n\n직전 응답이 유효한 JSON 이 아니었습니다. 설명이나 코드펜스 없이 JSON 객체 하나만 출력하세요."
-            text = self._request(retry_prompt, system)
+            text = self._request(prompt, system, max_output_tokens)
+        except GeminiEmptyResponse as e:
+            log(f"{e} - 1회 재요청")
+            text = ""
+        if text:
             try:
                 return extract_json(text)
-            except (json.JSONDecodeError, ValueError) as e:
-                raise GeminiParseError(f"JSON 파싱 실패: {e}")
+            except (json.JSONDecodeError, ValueError):
+                log("응답 JSON 파싱 실패 - JSON 만 출력하도록 1회 재요청")
+        try:
+            text = self._request(retry_prompt, system, max_output_tokens)
+            return extract_json(text)
+        except GeminiEmptyResponse as e:
+            raise GeminiParseError(f"재요청도 빈 텍스트: {e}")
+        except (json.JSONDecodeError, ValueError) as e:
+            raise GeminiParseError(f"JSON 파싱 실패: {e}")
 
 
 # --------------------------------------------------------------------------------------
@@ -593,20 +665,28 @@ class ReviewBackend:
 class GeminiBackend(ReviewBackend):
     """Gemini 호출 백엔드."""
 
-    def __init__(self, client: GeminiClient, language: str = "ko", max_hunk_chars: int = 12000) -> None:
+    def __init__(self, client: GeminiClient, language: str = "ko", max_hunk_chars: int = 12000,
+                 max_output_tokens_hunk: int = DEFAULT_MAX_OUTPUT_TOKENS_HUNK,
+                 max_output_tokens_summary: int = DEFAULT_MAX_OUTPUT_TOKENS_SUMMARY) -> None:
         self.client = client
         self.language = language if language in SYSTEM_PROMPT else "ko"
         self.max_hunk_chars = max_hunk_chars
-        self.label = f"Gemini {client.model}"
+        self.max_output_tokens_hunk = max(2048, int(max_output_tokens_hunk))
+        self.max_output_tokens_summary = max(4096, int(max_output_tokens_summary))
+
+    @property
+    def label(self) -> str:  # type: ignore[override]
+        """실제 사용 중인 모델(fallback 전환 반영)."""
+        return f"Gemini {self.client.model}"
 
     def review_hunks(self, file: FileDiff, hunks: Sequence[Hunk]) -> Dict[int, HunkReview]:
         prompt = build_hunk_prompt(file, hunks, self.language, self.max_hunk_chars)
-        data = self.client.generate_json(prompt, SYSTEM_PROMPT[self.language])
+        data = self.client.generate_json(prompt, SYSTEM_PROMPT[self.language], max_output_tokens=self.max_output_tokens_hunk)
         return parse_hunk_reviews(data)
 
     def summarize(self, ctx: SummaryContext) -> SummaryResult:
         prompt = build_summary_prompt(ctx, self.language)
-        data = self.client.generate_json(prompt, SYSTEM_PROMPT[self.language])
+        data = self.client.generate_json(prompt, SYSTEM_PROMPT[self.language], max_output_tokens=self.max_output_tokens_summary)
         return parse_summary(data)
 
 
@@ -1005,7 +1085,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--dryrun-output", default="review-dryrun.md")
     p.add_argument("--pr-title", default=os.environ.get("CHANGE_TITLE", ""))
     p.add_argument("--language", default=os.environ.get("REVIEW_LANGUAGE", "ko"))
-    p.add_argument("--model", default=os.environ.get("GEMINI_MODEL", DEFAULT_MODEL))
+    p.add_argument("--model", default=os.environ.get("GEMINI_MODEL", DEFAULT_MODEL),
+                   help=f"Gemini 모델 (env GEMINI_MODEL, 기본 {DEFAULT_MODEL})")
+    p.add_argument("--fallbacks", default=os.environ.get("GEMINI_MODEL_FALLBACKS", DEFAULT_MODEL_FALLBACKS),
+                   help=f"404/지속 429 시 순서대로 전환할 모델 (쉼표 구분, env GEMINI_MODEL_FALLBACKS, 기본 {DEFAULT_MODEL_FALLBACKS})")
+    p.add_argument("--max-output-tokens", type=int, default=int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS_HUNK)),
+                   help="hunk 리뷰 호출의 maxOutputTokens (총평은 이 값과 4096 중 큰 쪽)")
     return p
 
 
@@ -1054,13 +1139,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # 2. 백엔드
     backend: ReviewBackend
+    client: Optional[GeminiClient] = None
     if fake:
         backend = FakeBackend()
         log("GEMINI_FAKE=1: 가짜 백엔드 사용 (API 호출 없음)")
     else:
-        client = GeminiClient(api_key, model=args.model, api_url=os.environ.get("GEMINI_API_URL", DEFAULT_GEMINI_API_URL))
-        backend = GeminiBackend(client, language=args.language, max_hunk_chars=args.max_hunk_chars)
-        log(f"모델 {args.model}, 언어 {args.language}")
+        fallbacks = parse_model_list(args.fallbacks)
+        client = GeminiClient(api_key, model=args.model, api_url=os.environ.get("GEMINI_API_URL", DEFAULT_GEMINI_API_URL),
+                              fallbacks=fallbacks)
+        backend = GeminiBackend(client, language=args.language, max_hunk_chars=args.max_hunk_chars,
+                                max_output_tokens_hunk=args.max_output_tokens,
+                                max_output_tokens_summary=max(args.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS_SUMMARY))
+        log(f"모델 {args.model} (fallback: {', '.join(fallbacks) or '없음'}), 언어 {args.language}, maxOutputTokens hunk={backend.max_output_tokens_hunk} summary={backend.max_output_tokens_summary}")
 
     # 3. hunk 리뷰
     out = review_files(files, backend, args.max_hunk_chars, per_hunk=(args.granularity == "hunk"))
@@ -1125,7 +1215,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     }
     result = {
         "version": __version__, "repo": repo, "pr": pr, "base": base_sha, "head": head_sha_local, "head_sha_posted": head_sha_remote,
-        "model": args.model if not fake else "fake", "backend": backend.label, "posted": posted,
+        "model": (client.model if client else "fake"), "model_requested": (client.requested_model if client else "fake"),
+        "model_switches": (client.model_switches if client else []), "gemini_calls": (client.calls if client else 0),
+        "backend": backend.label, "posted": posted,
         "summary": summary.to_dict(), "summary_markdown": body, "stats": stats,
         "files": [{"path": f.path, "status": f.status, "hunks": len(f.hunks), "added": f.added_line_count, "removed": f.removed_line_count} for f in files],
         "skipped_files": [{"path": p, "reason": r} for p, r in skipped], "lock_files": lock_files, "unreviewed_files": unreviewed,
@@ -1137,6 +1229,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     print("\n=== AI Code Review 요약 ===")
     print(f"PR #{pr} ({repo}) backend={backend.label} base={base_sha[:10]} head={head_sha_local[:10]}")
+    if client and client.model_switches:
+        print("모델 전환: " + " -> ".join([client.requested_model] + [s["to"] for s in client.model_switches])
+              + f" (사유: {'; '.join(s['reason'] for s in client.model_switches)})")
     print(f"파일 {stats['files_reviewed']}/{stats['files_total']} 리뷰, hunk {stats['hunks']}, 코멘트 {stats['comments_total']} "
           f"(inline {stats['comments_inline']}, overflow {stats['comments_overflow']}, file-level {stats['comments_file_level']})")
     print(f"심각도 {json.dumps(stats['by_severity'], ensure_ascii=False)} / 권고 {summary.recommendation} / 위험도 {summary.risk}")

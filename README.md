@@ -39,15 +39,15 @@ bash infra/scripts/down.sh        # 중지 (볼륨 유지). --volumes 로 완전
 
 | 키 | 용도 |
 |---|---|
-| `GITHUB_OWNER`, `GITHUB_REPO` | 멀티브랜치 잡이 바라볼 GitHub 저장소 (비어 있으면 잡은 만들어지되 스캔하지 않음) |
+| `GITHUB_OWNER`, `GITHUB_REPO` | 멀티브랜치 잡이 바라볼 GitHub 저장소 (예: `jjang158` / `CICD_AI_FLOW`, **`.git` 접미사 없이**). 비어 있으면 잡은 만들어지되 스캔하지 않음 |
 | `GITHUB_USERNAME`, `GITHUB_TOKEN` | Jenkins credential `github-token` (PAT 권한: `repo`; PR 리뷰 코멘트 게시에도 사용) |
-| `GEMINI_API_KEY` | Jenkins credential `gemini-api-key` (GCP Gemini API). 비어 있으면 AI 리뷰 스테이지만 UNSTABLE 로 건너뜀 |
+| `GEMINI_API_KEY` | Jenkins credential `gemini-api-key` (GCP Gemini API). 비어 있으면 AI 리뷰 스테이지만 UNSTABLE 로 건너뜀. 기본 모델은 `gemini-3.5-flash`(CodeReview 잡 파라미터 `GEMINI_MODEL` 로 변경, 404/429 시 `GEMINI_MODEL_FALLBACKS` 로 자동 전환). 무료 티어 키는 pro 계열이 429(quota) 를 돌려주므로 flash 계열을 권장 |
 
 Jenkins UI 에서 직접 credential 을 수정해도 된다 (Manage Jenkins → Credentials → `github-token`, `gemini-api-key`).
 
 ## 3. GitHub 에 연결하기
 
-1. GitHub 에 빈 저장소 `cicd-ai-flow` 를 만들고 이 디렉터리를 push 한다 (`main` 브랜치, 취약 코드 데모용 `demo/vulnerable-code` 브랜치도 함께).
+1. GitHub 에 빈 저장소를 만들고 이 디렉터리를 push 한다 (`main` 브랜치, 취약 코드 데모용 `demo/vulnerable-code` 브랜치도 함께). 현재 연결된 저장소: `jjang158/CICD_AI_FLOW` (PR #1 = 데모 브랜치).
 2. `infra/.env` 에 `GITHUB_OWNER`, `GITHUB_USERNAME`, `GITHUB_TOKEN`, `GEMINI_API_KEY` 를 채우고 `bash infra/scripts/up.sh` 재실행.
 3. Jenkins 의 `cicd-ai-flow-cicd` 가 1분 주기로 `main` 을 스캔해 변경 시 빌드·배포하고, `cicd-ai-flow-codereview` 가 PR 을 발견하면 AI 리뷰를 PR 에 남긴다.
 4. 로컬 Jenkins 는 인터넷에서 접근할 수 없으므로 GitHub 웹훅 대신 **1분 주기 스캔**을 쓴다. 즉시 트리거가 필요하면 ngrok/cloudflared 로 웹훅을 연결한다 (`docs/PIPELINE.md` 3.2).
@@ -88,6 +88,9 @@ sonar-project.properties  루트 1개로 백엔드+프론트 동시 분석
 ```
 
 ## 7. 알아 둘 점
+
+- **PC 재부팅 후**: Docker Desktop 은 자동 시작이 꺼져 있다. Docker Desktop 을 켜면 컨테이너가 자동 복구되지만(`restart: unless-stopped`), 안전하게 `bash infra/scripts/up.sh`(멱등) 또는 `healthcheck.sh` 를 한 번 실행한다. 에이전트가 `Exited` 면 `docker restart cicd-jenkins-agent` 로 10초 내 복구되고 Jenkins 노드는 약 30초 내 online 이 된다.
+- GitHub PAT 는 `repo` 권한만 있으면 충분하다. 넓은 권한(admin:*, delete_repo 등)의 토큰은 쓰지 않는 것이 좋다.
 
 - SonarQube 는 Community Build 라 브랜치/PR 분석이 없다. 그래서 main 은 `cicd-ai-flow`, 그 외(PR·브랜치)는 `cicd-ai-flow-pr` 프로젝트로 분석한다.
 - 기본 Quality Gate `Sonar way` 는 "새 코드" 기준이라 프로젝트의 첫 분석은 무조건 PASS 된다. 이를 피하려고 부트스트랩이 전체 코드 기준 게이트 `cicd-ai-flow-gate`(vulnerabilities=0, bugs=0, 보안/신뢰성 A, 커버리지≥80%, 중복≤3%, 새 이슈 0) 를 만들어 두 프로젝트에 할당한다.

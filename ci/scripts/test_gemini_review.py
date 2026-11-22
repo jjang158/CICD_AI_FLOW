@@ -314,6 +314,70 @@ class LocalServerTest(unittest.TestCase):
         with self.assertRaises(gr.GeminiParseError):
             client.generate_json("p")
 
+    def test_fallback_on_404_switches_model(self) -> None:
+        """404(모델 없음/사용 불가) -> 다음 후보 모델로 전환하고 이후 호출도 그 모델을 쓴다."""
+        self.rec.script = [(404, {"error": {"message": "no longer available"}}), (200, _gemini_ok('{"ok": 1}'))]
+        client = gr.GeminiClient("k", model="m-old", api_url=self.base_url, sleep=lambda s: None, fallbacks=["m-new", "m-3"])
+        self.assertEqual(client.generate_json("p"), {"ok": 1})
+        self.assertEqual(client.model, "m-new")
+        self.assertEqual(client.requested_model, "m-old")
+        self.assertEqual([r[1] for r in self.rec.requests], ["/models/m-old:generateContent", "/models/m-new:generateContent"])
+        self.assertEqual(client.model_switches[0]["from"], "m-old")
+        self.assertEqual(client.model_switches[0]["reason"], "404 model unavailable")
+        self.rec.script = [(200, _gemini_ok('{"ok": 2}'))]
+        client.generate_json("p2")
+        self.assertEqual(self.rec.requests[-1][1], "/models/m-new:generateContent")
+        self.assertEqual(client.fallbacks, ["m-3"])
+
+    def test_fallback_on_persistent_429(self) -> None:
+        """429 가 재시도(3회) 후에도 지속되면 다음 모델로 전환한다."""
+        self.rec.script = [(429, {}), (429, {}), (429, {}), (200, _gemini_ok('{"ok": 1}'))]
+        sleeps: List[float] = []
+        client = gr.GeminiClient("k", model="m-pro", api_url=self.base_url, sleep=sleeps.append, backoff=1.0, retries=3, fallbacks=["m-flash"])
+        self.assertEqual(client.generate_json("p"), {"ok": 1})
+        self.assertEqual(client.model, "m-flash")
+        self.assertEqual(len(sleeps), 3)
+        self.assertEqual(client.model_switches[0]["reason"], "429 quota exceeded (after retries)")
+        backend = gr.GeminiBackend(client)
+        self.assertEqual(backend.label, "Gemini m-flash")
+
+    def test_all_models_fail_yields_placeholder_comments(self) -> None:
+        """모든 후보가 실패하면 hunk 마다 '자동 리뷰 실패' placeholder 코멘트가 남는다."""
+        self.rec.script = [(404, {}), (404, {})]
+        client = gr.GeminiClient("k", model="m1", api_url=self.base_url, sleep=lambda s: None, fallbacks=["m2"])
+        backend = gr.GeminiBackend(client)
+        foo = next(f for f in gr.parse_unified_diff(SAMPLE_DIFF) if f.path.endswith("Foo.kt"))
+        out = gr.review_files([foo], backend, 12000, per_hunk=False)
+        self.assertEqual(len(out.comments), 2)
+        self.assertTrue(all(c.auto_failed for c in out.comments))
+        self.assertEqual(len(out.failures), 1)
+        self.assertEqual(client.model, "m2")
+        self.assertEqual(client.fallbacks, [])
+        self.assertEqual(len(self.rec.requests), 2)
+
+    def test_empty_text_response_triggers_single_retry(self) -> None:
+        """parts 에 text 가 없으면(사고 토큰만) 파싱 실패와 같이 1회 재요청, 또 비면 GeminiParseError."""
+        empty = {"candidates": [{"content": {"parts": [{"thought": True, "text": "..."}]}, "finishReason": "MAX_TOKENS"}]}
+        self.rec.script = [(200, empty), (200, _gemini_ok('{"ok": true}'))]
+        client = gr.GeminiClient("k", api_url=self.base_url, sleep=lambda s: None)
+        self.assertEqual(client.generate_json("p"), {"ok": True})
+        self.assertEqual(len(self.rec.requests), 2)
+        self.assertEqual(self.rec.requests[0][2]["generationConfig"]["maxOutputTokens"], gr.DEFAULT_MAX_OUTPUT_TOKENS_HUNK)
+        self.assertIn("유효한 JSON", self.rec.requests[1][2]["contents"][0]["parts"][0]["text"])
+        self.rec.script = [(200, empty), (200, empty)]
+        with self.assertRaises(gr.GeminiParseError):
+            client.generate_json("p")
+
+    def test_summary_uses_larger_token_budget(self) -> None:
+        self.rec.script = [(200, _gemini_ok('{"overview": "o", "risk": "low", "recommendation": "approve"}'))]
+        client = gr.GeminiClient("k", api_url=self.base_url, sleep=lambda s: None)
+        backend = gr.GeminiBackend(client, max_output_tokens_hunk=100, max_output_tokens_summary=100)
+        self.assertEqual((backend.max_output_tokens_hunk, backend.max_output_tokens_summary), (2048, 4096))
+        ctx = gr.SummaryContext(pr_number=1, pr_title="t", base="b", head="h", files=[], hunk_summaries=[], comments=[],
+                                ci_summary="", lock_files=[], skipped_files=[], unreviewed_files=[])
+        self.assertEqual(backend.summarize(ctx).recommendation, "approve")
+        self.assertEqual(self.rec.requests[-1][2]["generationConfig"]["maxOutputTokens"], 4096)
+
     def test_github_review_then_fallback(self) -> None:
         gh = gr.GitHubClient("tok", "acme/widgets", api_url=self.base_url)
         c = gr.Comment(path="a.kt", line=3, severity="major", category="bug", body="fix", hunk_index=1)

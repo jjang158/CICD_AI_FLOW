@@ -133,7 +133,7 @@ cicd-ai-flow/
 | 4 | AI Code Review | `git diff <base>...HEAD` 를 파일/hunk 단위로 Gemini 에 전달 → 수정 부위마다 인라인 코멘트 + 총평 → GitHub PR Review(COMMENT) 등록 |
 | 5 | Report | PR commit status / 빌드 설명 갱신 |
 
-Gemini: `GEMINI_MODEL` 기본 `gemini-2.5-pro`(env 로 변경 가능), REST `generativelanguage.googleapis.com/v1beta/models/{model}:generateContent`, 키는 Jenkins credential `gemini-api-key`. 키가 비어있으면 AI 리뷰 스테이지는 **UNSTABLE** 로 표기하고 나머지 스테이지는 정상 진행.
+Gemini: `GEMINI_MODEL` 기본 **`gemini-3.5-flash`**(2026-11-23 실측: `gemini-2.5-*` 는 신규 사용자에게 404, pro 계열은 무료 티어에서 429 quota) + `GEMINI_MODEL_FALLBACKS`(`gemini-3-flash-preview,gemini-3.1-flash-lite`) 로 404/429 시 자동 전환. REST `generativelanguage.googleapis.com/v1beta/models/{model}:generateContent`, 키는 Jenkins credential `gemini-api-key`. 키가 비어있으면 AI 리뷰 스테이지는 **UNSTABLE** 로 표기하고 나머지 스테이지는 정상 진행.
 `gemini_review.py` 는 `--dry-run`(GitHub 에 올리지 않고 stdout 출력)과 `GEMINI_FAKE=1`(API 호출 없이 고정 응답) 모드를 지원해 키 없이도 검증 가능해야 한다.
 
 ## 6. 상호 검증 체크리스트 (에이전트 간 호출로 확인)

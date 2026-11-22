@@ -189,8 +189,9 @@ GitHub repo → *Settings → Webhooks → Add webhook*: Payload URL `https://<t
    - **`infra/.env`** 의 `GEMINI_API_KEY=...` 를 채우고 `bash infra/scripts/up.sh` 재실행 (JCasC 가 `gemini-api-key` secret text 로 주입).
    - **Jenkins UI**: *Manage Jenkins → Credentials → System → Global → gemini-api-key → Update → Secret* 입력. (JCasC 재로드 시 `.env` 값으로 다시 덮어쓰이므로 `.env` 도 맞춰 두는 것을 권장)
 3. 키가 비어 있으면 *AI Code Review* 스테이지가 `WARNING: GEMINI_API_KEY 가 비어 있습니다` 를 남기고 **UNSTABLE** 로 끝난다. 나머지 스테이지는 정상 진행.
-4. 모델 변경: 잡 파라미터 `GEMINI_MODEL`(빌드 시 지정) 또는 `ci/Jenkinsfile.codereview` 의 기본값 수정. 스크립트 단독 실행 시에는 환경변수 `GEMINI_MODEL` 또는 `--model`. REST 엔드포인트는 `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent` 이며 `GEMINI_API_URL` 로 바꿀 수 있다(테스트용).
-5. 무료 티어는 분당 요청 수 제한이 낮다(모델별 상이). 429 는 3회 지수 백오프로 재시도하지만, 큰 PR 은 `REVIEW_GRANULARITY=file`(기본) 을 유지하고 `gemini-2.5-flash` 를 고려하라.
+4. **기본 모델은 `gemini-3.5-flash`(GA)**, fallback 은 `gemini-3-flash-preview,gemini-3.1-flash-lite`. 실측(2026-11-23, 무료 티어 키): `gemini-2.5-*` 는 **404**("no longer available to new users"), **pro 계열(`gemini-3.1-pro-preview` 등)은 전부 429 quota exceeded**, `gemini-3.5-flash`/`gemini-3.5-flash-lite`/`gemini-3-flash-preview`/`gemini-3.1-flash-lite` 200 OK. `gemini_review.py` 는 호출이 **404** 이거나 **429 가 3회 재시도 후에도 지속**되면 다음 fallback 모델로 전환해 이후 모든 호출에 그 모델을 쓴다(로그 `모델 전환: A -> B (사유)`, `review-result.json` 의 `model`/`model_requested`/`model_switches`, 총평 헤더 `AI Code Review (Gemini <실제 모델>)`). 모든 후보가 실패하면 해당 hunk 는 "자동 리뷰 실패" placeholder 코멘트로 남는다.
+5. 모델 변경: 잡 파라미터 `GEMINI_MODEL` / `GEMINI_MODEL_FALLBACKS`(빌드 시 지정) 또는 `ci/Jenkinsfile.codereview` 의 기본값 수정. 스크립트 단독 실행 시에는 환경변수 `GEMINI_MODEL`, `GEMINI_MODEL_FALLBACKS`(또는 `--model`, `--fallbacks`), 출력 토큰 상한은 `GEMINI_MAX_OUTPUT_TOKENS`(기본 8192; hunk 최소 2048, 총평 최소 4096 — thinking 모델은 사고 토큰이 출력에 포함되므로 작게 잡으면 `parts` 에 text 가 없는 빈 응답이 온다. 빈 응답은 파싱 실패로 취급해 1회 재요청한다). REST 엔드포인트는 `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent` 이며 `GEMINI_API_URL` 로 바꿀 수 있다(테스트용).
+6. 무료 티어는 분당 요청 수 제한이 낮다(모델별 상이). 429 는 3회 지수 백오프로 재시도한 뒤 fallback 으로 넘어가지만, 큰 PR 은 `REVIEW_GRANULARITY=file`(기본) 을 유지하고 필요하면 `gemini-3.5-flash-lite` 를 고려하라.
 
 ---
 
